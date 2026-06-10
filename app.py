@@ -9,15 +9,47 @@ GET  /          : usage instructions
 
 import io
 import json
+import threading
 import pandas as pd
 from typing import List, Optional, Tuple
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
+from contextlib import asynccontextmanager
 from agent import run
 from tools import check_llm
 
+# ── Model preloading ───────────────────────────────────────────────────────────
+# Models are loaded once at startup in a background thread.
+# /health responds immediately; /ready returns 503 until loading finishes.
+
+_models_ready  = False
+_startup_error = ""
+
+
+def _preload_models():
+    global _models_ready, _startup_error
+    try:
+        from tools import _load_xgb, _load_transformer
+        _load_xgb()
+        print("[startup] XGBoost + GeoClusterer loaded.")
+        _load_transformer()
+        print("[startup] Transformer loaded.")
+        _models_ready = True
+        print("[startup] All models ready.")
+    except Exception as e:
+        _startup_error = str(e)
+        print(f"[startup] Model preload failed: {e}")
+
+
+@asynccontextmanager
+async def lifespan(app):
+    threading.Thread(target=_preload_models, daemon=True).start()
+    yield
+
+
 app = FastAPI(
     title="Airbnb Price Tier Predictor",
+    lifespan=lifespan,
     description=(
         "LangGraph agent that predicts NYC Airbnb price tiers (0=Budget, 1=Standard, "
         "2=Premium, 3=Ultra-Luxury). Handles messy CSVs, altered column names, "
@@ -130,6 +162,16 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/ready")
+def ready():
+    """Returns 200 when models are loaded, 503 while still loading."""
+    if _models_ready:
+        return {"status": "ready"}
+    if _startup_error:
+        return JSONResponse({"status": "error", "detail": _startup_error}, status_code=503)
+    return JSONResponse({"status": "loading"}, status_code=503)
 
 
 @app.get("/llm-health")
