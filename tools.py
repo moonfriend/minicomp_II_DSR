@@ -15,7 +15,6 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from langchain_core.tools import tool
-from langchain_core.prompts import PromptTemplate
 
 # ── LLM factory ───────────────────────────────────────────────────────────────
 
