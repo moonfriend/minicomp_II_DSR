@@ -102,12 +102,19 @@ def _reviews_text(val) -> str:
     return f"highly reviewed ({n} reviews)"
 
 
-def _availability_text(val) -> str:
+def _availability_text(val, reviews=None) -> str:
     try:
         n = int(float(val))
     except (ValueError, TypeError):
         return ""
-    if n <= 30:  return "rarely available, almost always booked"
+    if n <= 30:
+        if reviews is not None:
+            try:
+                if int(float(reviews)) == 0:
+                    return "new listing, availability unknown"
+            except (ValueError, TypeError):
+                pass
+        return "rarely available, almost always booked"
     if n <= 90:  return f"occasionally available ({n} days/year)"
     if n <= 180: return f"often available ({n} days/year)"
     return f"frequently available ({n} days/year)"
@@ -147,11 +154,14 @@ def row_to_text(row: dict) -> str:
         (_minimum_nights_text, "minimum_nights"),
         (_reviews_text,        "number_of_reviews"),
         (_host_listings_text,  "calculated_host_listings_count"),
-        (_availability_text,   "availability_365"),
     ]:
         t = fn(row.get(key))
         if t:
             parts.append(t)
+
+    t = _availability_text(row.get("availability_365"), row.get("number_of_reviews"))
+    if t:
+        parts.append(t)
 
     # TODO: convert latitude/longitude to area description (backlog)
 
