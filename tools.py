@@ -1,18 +1,47 @@
 """
 LangChain tools called by the LangGraph agent.
-Each tool is a pure function: deterministic Python where possible,
-LLM only where genuinely needed.
+LLM is used only for high-value reasoning tasks (3 calls max per request):
+  1. Schema detection  — map unknown column names to canonical ones
+  2. Language + translation — detect non-English, translate batch
+  3. Missing data inference — infer key tabular values from description text
+Deterministic Python handles everything else.
 """
 
 import re
 import json
+import os
 import joblib
 import numpy as np
 import pandas as pd
 from pathlib import Path
 from langchain_core.tools import tool
+from langchain_core.prompts import PromptTemplate
 
-# ── Column normalisation ──────────────────────────────────────────────────────
+# ── LLM factory ───────────────────────────────────────────────────────────────
+
+def _get_llm():
+    if os.getenv("OPENROUTER_API_KEY"):
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            model="meta-llama/llama-3.1-8b-instruct:free",
+            base_url="https://openrouter.ai/api/v1",
+            api_key=os.environ["OPENROUTER_API_KEY"],
+            temperature=0,
+        )
+    from langchain_ollama import OllamaLLM
+    return OllamaLLM(model="llama3.2", temperature=0)
+
+
+def _llm_json(prompt_text: str) -> dict:
+    """Call LLM, extract first JSON object from response."""
+    llm = _get_llm()
+    raw = llm.invoke(prompt_text)
+    raw_str = raw.content if hasattr(raw, "content") else str(raw)
+    match = re.search(r"\{.*\}", raw_str, re.DOTALL)
+    return json.loads(match.group()) if match else {}
+
+
+# ── Canonical schema ──────────────────────────────────────────────────────────
 
 CANONICAL_COLUMNS = {
     "property_id", "description", "neighbourhood_group", "neighbourhood",
@@ -20,8 +49,7 @@ CANONICAL_COLUMNS = {
     "number_of_reviews", "calculated_host_listings_count", "availability_365",
 }
 
-# Common aliases the curveball set might use
-ALIAS_MAP = {
+KNOWN_ALIASES = {
     "id": "property_id", "listing_id": "property_id",
     "name": "description", "title": "description",
     "summary": "description", "neighborhood_overview": "description",
@@ -49,27 +77,44 @@ CATEGORICAL_DEFAULTS = {
 
 
 @tool
-def normalize_columns(csv_text: str) -> str:
+def detect_schema(csv_text: str) -> str:
     """
-    Parse a CSV string, rename aliased columns to canonical names,
-    fill missing columns with safe defaults.
-    Returns a JSON string of records ready for prediction.
+    Parse CSV, map columns to canonical names.
+    Known aliases are resolved with a dict lookup (free).
+    Truly unknown columns are sent to the LLM in ONE call.
+    Returns a JSON string of normalised records.
     """
     from io import StringIO
     df = pd.read_csv(StringIO(csv_text))
-
-    # lowercase all column names for matching
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
-    # rename known aliases
-    df = df.rename(columns={k: v for k, v in ALIAS_MAP.items() if k in df.columns})
+    # resolve known aliases first
+    df = df.rename(columns={k: v for k, v in KNOWN_ALIASES.items() if k in df.columns})
 
-    # fill missing canonical columns with defaults
+    # find columns still not recognised
+    unknown = [c for c in df.columns if c not in CANONICAL_COLUMNS]
+
+    if unknown:
+        sample_rows = df[unknown].head(3).to_dict(orient="records")
+        prompt = f"""You are mapping CSV columns from an Airbnb dataset to canonical names.
+
+Canonical columns: {sorted(CANONICAL_COLUMNS)}
+
+Unknown columns found: {unknown}
+Sample values: {json.dumps(sample_rows, default=str)}
+
+Return ONLY a JSON object mapping each unknown column to its canonical name,
+or null if it has no match. Example: {{"listing_name": "description", "borough_name": "neighbourhood_group", "xyz": null}}"""
+
+        mapping = _llm_json(prompt)
+        rename = {k: v for k, v in mapping.items() if v and v in CANONICAL_COLUMNS}
+        df = df.rename(columns=rename)
+
+    # fill missing canonical columns with safe defaults
     for col, default in {**NUMERIC_DEFAULTS, **CATEGORICAL_DEFAULTS}.items():
         if col not in df.columns:
             df[col] = default
 
-    # fill missing values within existing columns
     for col, default in NUMERIC_DEFAULTS.items():
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(default)
@@ -82,65 +127,100 @@ def normalize_columns(csv_text: str) -> str:
     return df.to_json(orient="records")
 
 
-# ── LLM text feature extraction ───────────────────────────────────────────────
+# ── Language detection + translation ─────────────────────────────────────────
 
-FLAG_COLS = ["has_luxury", "has_view", "has_outdoor", "is_shared",
-             "needs_work", "has_amenities"]
-
-_EXTRACT_TEMPLATE = """Analyze this Airbnb listing and return ONLY a JSON object:
-  has_luxury   : true if mentions luxury, penthouse, marble, doorman, concierge
-  has_view     : true if mentions view, skyline, park view, river, city view
-  has_outdoor  : true if mentions rooftop, balcony, terrace, garden
-  is_shared    : true if mentions shared bathroom, shared room, hostel
-  needs_work   : true if mentions renovation, repair, fixer, basic, worn
-  has_amenities: true if mentions pool, gym, spa, elevator, fireplace
-
-Listing: "{description}"
-
-Reply with ONLY the JSON. Example: {{"has_luxury":false,"has_view":true,"has_outdoor":false,"is_shared":false,"needs_work":false,"has_amenities":false}}"""
-
-
-def _get_llm():
-    """Return OpenRouter LLM in production, Ollama locally."""
-    import os
-    if os.getenv("OPENROUTER_API_KEY"):
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
-            model="meta-llama/llama-3.1-8b-instruct:free",
-            base_url="https://openrouter.ai/api/v1",
-            api_key=os.environ["OPENROUTER_API_KEY"],
-            temperature=0,
-        )
-    from langchain_ollama import OllamaLLM
-    return OllamaLLM(model="llama3.2", temperature=0)
+def _is_likely_non_english(text: str) -> bool:
+    """Cheap heuristic: high ratio of non-ASCII chars suggests non-English."""
+    if not text:
+        return False
+    non_ascii = sum(1 for c in text if ord(c) > 127)
+    return (non_ascii / len(text)) > 0.15
 
 
 @tool
-def extract_text_features(records_json: str) -> str:
+def translate_descriptions(records_json: str) -> str:
     """
-    For each listing, call the LLM to extract boolean luxury/quality flags
-    from the description. Returns the records JSON with flag columns added.
+    Detect non-English descriptions and translate them in ONE batched LLM call.
+    English descriptions are passed through untouched.
     """
-    from langchain_core.prompts import PromptTemplate
-
     records = json.loads(records_json)
-    llm = _get_llm()
-    prompt = PromptTemplate(input_variables=["description"],
-                            template=_EXTRACT_TEMPLATE)
-    chain = prompt | llm
+    to_translate = {
+        i: rec["description"]
+        for i, rec in enumerate(records)
+        if _is_likely_non_english(str(rec.get("description", "")))
+    }
 
-    for rec in records:
-        desc = str(rec.get("description", ""))
-        try:
-            raw = chain.invoke({"description": desc})
-            raw_str = raw.content if hasattr(raw, "content") else str(raw)
-            match = re.search(r"\{.*\}", raw_str, re.DOTALL)
-            flags = json.loads(match.group()) if match else {}
-        except Exception:
-            flags = {}
-        for col in FLAG_COLS:
-            rec[col] = int(bool(flags.get(col, False)))
+    if not to_translate:
+        return records_json
 
+    prompt = f"""Translate these Airbnb listing descriptions to English.
+Return ONLY a JSON object mapping each index to its English translation.
+
+Descriptions to translate:
+{json.dumps(to_translate, ensure_ascii=False)}
+
+Example output: {{"3": "Cozy studio in the heart of Paris", "7": "Luxury penthouse with sea view"}}"""
+
+    translations = _llm_json(prompt)
+    for idx_str, translated in translations.items():
+        idx = int(idx_str)
+        if idx < len(records):
+            records[idx]["description"] = translated
+
+    print(f"  Translated {len(to_translate)} non-English descriptions.")
+    return json.dumps(records)
+
+
+# ── Missing tabular data inference ────────────────────────────────────────────
+
+INFERABLE_COLS = ["neighbourhood_group", "neighbourhood", "room_type"]
+
+
+@tool
+def infer_missing_tabular(records_json: str) -> str:
+    """
+    For rows where key tabular columns are missing/unknown, call the LLM ONCE
+    with a batch of problematic rows and ask it to infer values from the description.
+    """
+    records = json.loads(records_json)
+
+    missing_rows = {}
+    for i, rec in enumerate(records):
+        missing = [
+            col for col in INFERABLE_COLS
+            if not rec.get(col) or str(rec.get(col)) in ("Unknown", "nan", "")
+        ]
+        if missing:
+            missing_rows[i] = {
+                "description": rec.get("description", ""),
+                "missing_cols": missing,
+            }
+
+    if not missing_rows:
+        return records_json
+
+    prompt = f"""You are filling in missing data for NYC Airbnb listings.
+For each listing, infer the missing columns from the description.
+
+Valid values:
+  neighbourhood_group: Manhattan, Brooklyn, Queens, Bronx, Staten Island
+  room_type: Entire home/apt, Private room, Shared room
+
+Listings needing inference:
+{json.dumps(missing_rows, indent=2)}
+
+Return ONLY a JSON object: index → {{column: inferred_value}}.
+Example: {{"2": {{"neighbourhood_group": "Manhattan", "room_type": "Entire home/apt"}}}}"""
+
+    inferences = _llm_json(prompt)
+    for idx_str, values in inferences.items():
+        idx = int(idx_str)
+        if idx < len(records):
+            for col, val in values.items():
+                if col in INFERABLE_COLS:
+                    records[idx][col] = val
+
+    print(f"  Inferred missing values for {len(missing_rows)} rows.")
     return json.dumps(records)
 
 
@@ -157,21 +237,18 @@ ORDINAL  = ["neighbourhood"]
 @tool
 def run_xgb_predict(records_json: str) -> str:
     """
-    Load the pre-trained XGBoost pipeline and predict price_tier for each record.
+    Load the pre-trained XGBoost pipeline and predict price_tier.
     Returns JSON list of {property_id, price_tier}.
     """
     records = json.loads(records_json)
     df = pd.DataFrame(records)
 
     pipeline = joblib.load(MODEL_PATH)
-    feature_cols = NUMERIC + ONEHOT + ORDINAL + FLAG_COLS
-
-    # keep only columns the model knows; fill any still-missing flags with 0
-    for col in FLAG_COLS:
-        if col not in df.columns:
-            df[col] = 0
+    feature_cols = NUMERIC + ONEHOT + ORDINAL
 
     preds = pipeline.predict(df[feature_cols])
-    results = [{"property_id": int(r["property_id"]), "price_tier": int(p)}
-               for r, p in zip(records, preds)]
+    results = [
+        {"property_id": int(r["property_id"]), "price_tier": int(p)}
+        for r, p in zip(records, preds)
+    ]
     return json.dumps(results)
