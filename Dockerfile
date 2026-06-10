@@ -12,7 +12,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # App code
-COPY app.py agent.py tools.py utils.py ./
+COPY app.py agent.py tools.py utils.py geo_features.py ./
 
 # Pre-trained model artefact (trained locally, bundled into image)
 COPY models/ ./models/
