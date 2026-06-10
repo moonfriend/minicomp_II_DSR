@@ -12,13 +12,24 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # App code
-COPY app.py agent.py tools.py utils.py geo_features.py ./
+COPY app.py agent.py tools.py utils.py geo_features.py transformer_pipeline.py ./
 
-# Pre-trained model artefact (trained locally, bundled into image)
+# Pre-trained tabular model artefacts
 COPY models/ ./models/
 
-# Pre-download embedding model at build time so runtime doesn't hit HF
+# Pre-download sentence-transformer embedding model
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+
+# Pre-download fine-tuned DistilBERT from HuggingFace (baked into image layer)
+# HF_TOKEN build arg needed only if the repo is private
+ARG HF_TOKEN=""
+RUN python -c "\
+from transformers import AutoModelForSequenceClassification, AutoTokenizer; \
+import os; \
+token = os.environ.get('HF_TOKEN', '') or '${HF_TOKEN}' or None; \
+AutoTokenizer.from_pretrained('Li-1113/airbnb-price-tier', token=token); \
+AutoModelForSequenceClassification.from_pretrained('Li-1113/airbnb-price-tier', token=token); \
+print('Transformer model cached.')"
 
 EXPOSE 8000
 

@@ -15,7 +15,7 @@ Evaluation node runs only when labels_csv is provided.
 from typing import TypedDict, Optional
 from langgraph.graph import StateGraph, END
 from tools import (detect_schema, translate_descriptions,
-                   infer_missing_tabular, run_xgb_predict)
+                   infer_missing_tabular, run_ensemble_predict)
 
 MAX_RETRIES = 2
 
@@ -65,7 +65,7 @@ def node_infer_missing(state: AgentState) -> AgentState:
 
 def node_predict(state: AgentState) -> AgentState:
     try:
-        result = run_xgb_predict.invoke(
+        result = run_ensemble_predict.invoke(
             {"records_json": state["enriched_json"]}
         )
         return {**state, "predictions": result, "error": ""}

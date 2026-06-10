@@ -77,6 +77,7 @@ KNOWN_ALIASES = {
     "area": "neighbourhood", "location": "neighbourhood",
     "type": "room_type", "listing_type": "room_type",
     "min_nights": "minimum_nights", "minimum_stay": "minimum_nights",
+    "min_nights_required": "minimum_nights",   # seen in validation_full.csv
     "reviews": "number_of_reviews", "num_reviews": "number_of_reviews",
     "host_listings": "calculated_host_listings_count",
     "host_listings_count": "calculated_host_listings_count",
@@ -244,36 +245,91 @@ Example: {{"2": {{"neighbourhood_group": "Manhattan", "room_type": "Entire home/
     return json.dumps(records)
 
 
-# ── XGBoost prediction ────────────────────────────────────────────────────────
+# ── Prediction (ensemble XGBoost + Transformer) ───────────────────────────────
 
 MODEL_PATH = Path("models/xgb_model.joblib")
 GEO_PATH   = Path("models/geo_clusterer.joblib")
+HF_REPO    = "Li-1113/airbnb-price-tier"
+XGB_WEIGHT = 0.3   # tuned on validation_full.csv: best F1=0.5895 at xgb_w=0.3
 
 NUMERIC  = ["minimum_nights", "number_of_reviews", "calculated_host_listings_count",
             "availability_365", "latitude", "longitude"]
 ONEHOT   = ["neighbourhood_group", "room_type"]
 ORDINAL  = ["neighbourhood", "geo_label"]
 
+# module-level cache — loaded once, reused across requests
+_xgb_pipeline    = None
+_geo_clusterer   = None
+_transformer     = None
+_tokenizer       = None
+
+
+def _load_xgb():
+    global _xgb_pipeline, _geo_clusterer
+    if _xgb_pipeline is None:
+        _xgb_pipeline  = joblib.load(MODEL_PATH)
+    if _geo_clusterer is None:
+        from geo_features import GeoClusterer
+        _geo_clusterer = GeoClusterer.load(GEO_PATH)
+    return _xgb_pipeline, _geo_clusterer
+
+
+def _load_transformer():
+    global _transformer, _tokenizer
+    if _transformer is None:
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+        hf_token = os.getenv("HF_TOKEN")
+        print(f"  Loading transformer from {HF_REPO} …")
+        _tokenizer   = AutoTokenizer.from_pretrained(HF_REPO, token=hf_token)
+        _transformer = AutoModelForSequenceClassification.from_pretrained(
+            HF_REPO, num_labels=4, token=hf_token
+        )
+        _transformer.eval()
+        print("  Transformer loaded.")
+    return _transformer, _tokenizer
+
 
 @tool
-def run_xgb_predict(records_json: str) -> str:
+def run_ensemble_predict(records_json: str) -> str:
     """
-    Load the pre-trained XGBoost pipeline and predict price_tier.
-    Applies geographic cluster label before predicting.
+    Ensemble: XGBoost tabular + DistilBERT text probabilities → weighted average.
+    Falls back to XGBoost-only if the transformer cannot be loaded.
     Returns JSON list of {property_id, price_tier}.
     """
-    from geo_features import GeoClusterer, add_geo_label_to_df
+    import torch
+    from geo_features import add_geo_label_to_df
+    from transformer_pipeline import build_texts, MAX_LEN
 
-    records = json.loads(records_json)
-    df = pd.DataFrame(records)
+    records  = json.loads(records_json)
+    df       = pd.DataFrame(records)
 
-    gc = GeoClusterer.load(GEO_PATH)
-    df = add_geo_label_to_df(df, gc)
+    pipeline, gc = _load_xgb()
+    df_geo = add_geo_label_to_df(df, gc)
 
-    pipeline = joblib.load(MODEL_PATH)
-    feature_cols = NUMERIC + ONEHOT + ORDINAL
+    # ── XGBoost probabilities ──────────────────────────────────────────────────
+    xgb_proba = pipeline.predict_proba(df_geo[NUMERIC + ONEHOT + ORDINAL])  # (N,4)
 
-    preds = pipeline.predict(df[feature_cols])
+    # ── Transformer probabilities (with fallback) ──────────────────────────────
+    try:
+        model, tokenizer = _load_transformer()
+        texts      = build_texts(df_geo.reset_index(drop=True))
+        all_logits = []
+        for i in range(0, len(texts), 64):
+            enc = tokenizer(
+                texts[i:i + 64], truncation=True,
+                padding="max_length", max_length=MAX_LEN, return_tensors="pt",
+            )
+            with torch.no_grad():
+                all_logits.append(model(**enc).logits)
+        logits            = torch.cat(all_logits, dim=0)
+        transformer_proba = torch.softmax(logits, dim=1).numpy()
+        combined          = XGB_WEIGHT * xgb_proba + (1 - XGB_WEIGHT) * transformer_proba
+        print(f"  Ensemble: XGBoost×{XGB_WEIGHT} + Transformer×{1-XGB_WEIGHT}")
+    except Exception as e:
+        print(f"  Transformer unavailable ({e}), using XGBoost only.")
+        combined = xgb_proba
+
+    preds = np.argmax(combined, axis=1)
     results = [
         {"property_id": int(r["property_id"]), "price_tier": int(p)}
         for r, p in zip(records, preds)
