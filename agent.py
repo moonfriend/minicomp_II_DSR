@@ -131,7 +131,8 @@ def node_predict(state: AgentState) -> AgentState:
         counts = [sum(1 for p in preds if p["price_tier"] == t) for t in range(4)]
         names  = ["Budget", "Standard", "Premium", "Ultra-Luxury"]
         dist   = ", ".join(f"{names[t]}: {counts[t]}" for t in range(4) if counts[t] > 0)
-        logs.append(f"Ensemble (XGBoost 30% + HF API 70%) → {len(preds)} predictions")
+        from tools import XGB_WEIGHT
+        logs.append(f"Ensemble (XGBoost {XGB_WEIGHT*100:.0f}% + HF API {(1-XGB_WEIGHT)*100:.0f}%) → {len(preds)} predictions")
         logs.append(f"Tier distribution: {dist}")
         return {**state, "predictions": result, "logs": logs, "error": ""}
     except Exception as e:
