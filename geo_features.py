@@ -25,9 +25,31 @@ from sklearn.metrics import f1_score
 import joblib
 from pathlib import Path
 
-N_CLUSTERS   = 15      # enough to capture Manhattan sub-areas, outer borough zones
+N_CLUSTERS   = 15
 RANDOM_STATE = 42
 MODEL_PATH   = Path("models/geo_clusterer.joblib")
+
+# Known Ultra-Luxury hotspots in NYC (lat, lon)
+LUXURY_HOTSPOTS = {
+    "central_park":    (40.7829, -73.9654),
+    "tribeca":         (40.7195, -74.0089),
+    "upper_east_side": (40.7736, -73.9566),
+    "midtown":         (40.7549, -73.9840),
+    "soho":            (40.7233, -74.0030),
+}
+
+
+def add_hotspot_distances(df: pd.DataFrame) -> pd.DataFrame:
+    """Add dist_<hotspot> columns (Euclidean degrees — scale-free for tree models)."""
+    df = df.copy()
+    lats = df["latitude"].values
+    lons = df["longitude"].values
+    for name, (hlat, hlon) in LUXURY_HOTSPOTS.items():
+        df[f"dist_{name}"] = np.sqrt((lats - hlat) ** 2 + (lons - hlon) ** 2)
+    return df
+
+
+HOTSPOT_FEATURES = [f"dist_{name}" for name in LUXURY_HOTSPOTS]
 
 
 TIER_BUCKET_LABELS = {

@@ -252,8 +252,10 @@ HF_REPO    = "Li-1113/airbnb-price-tier"
 HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_REPO}"
 XGB_WEIGHT = 0.3   # tuned on validation_full.csv: best F1=0.5895 at xgb_w=0.3
 
+from geo_features import HOTSPOT_FEATURES
+
 NUMERIC  = ["minimum_nights", "number_of_reviews", "calculated_host_listings_count",
-            "availability_365", "latitude", "longitude"]
+            "availability_365", "latitude", "longitude"] + HOTSPOT_FEATURES
 ONEHOT   = ["neighbourhood_group", "room_type"]
 ORDINAL  = ["neighbourhood", "geo_label"]
 
@@ -364,13 +366,13 @@ def run_ensemble_predict(records_json: str) -> str:
     Falls back to XGBoost-only if the HF API is unreachable.
     Returns JSON list of {property_id, price_tier}.
     """
-    from geo_features import add_geo_label_to_df
+    from geo_features import add_geo_label_to_df, add_hotspot_distances
 
     records = json.loads(records_json)
     df      = pd.DataFrame(records)
 
     pipeline, gc = _load_xgb()
-    df_geo = add_geo_label_to_df(df, gc)
+    df_geo = add_hotspot_distances(add_geo_label_to_df(df, gc))
 
     # ── XGBoost probabilities ──────────────────────────────────────────────────
     xgb_proba = pipeline.predict_proba(df_geo[NUMERIC + ONEHOT + ORDINAL])  # (N,4)

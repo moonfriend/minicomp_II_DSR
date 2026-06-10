@@ -12,8 +12,10 @@ from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OrdinalEncoder, OneHotEncoder
 from sklearn.metrics import f1_score, classification_report
+from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
-from geo_features import GeoClusterer, add_geo_label_to_df
+from geo_features import (GeoClusterer, add_geo_label_to_df,
+                           add_hotspot_distances, HOTSPOT_FEATURES)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 TRAIN_FILE   = "data/train_01.csv"
@@ -22,10 +24,14 @@ VAL_SIZE     = 0.1
 RANDOM_STATE = 42
 MODEL_PATH   = Path("models/xgb_model.joblib")
 
+# Best config from sweep: k=5, hotspot distances, balanced class weights
+# Internal val F1=0.6320 vs 0.5295 baseline (+0.10)
+N_GEO_CLUSTERS = 5
+
 NUMERIC_FEATURES = [
     "minimum_nights", "number_of_reviews", "calculated_host_listings_count",
     "availability_365", "latitude", "longitude",
-]
+] + HOTSPOT_FEATURES
 ONEHOT_FEATURES  = ["neighbourhood_group", "room_type"]
 ORDINAL_FEATURES = ["neighbourhood", "geo_label"]
 
@@ -58,13 +64,13 @@ def main():
     )
 
     # fit geographic clusters on training rows only
-    gc = GeoClusterer()
+    gc = GeoClusterer(n_clusters=N_GEO_CLUSTERS)
     gc.fit(train_rows)
     gc.save()
 
-    train_rows = add_geo_label_to_df(train_rows, gc)
-    val_rows   = add_geo_label_to_df(val_rows,   gc)
-    test_df    = add_geo_label_to_df(test_df,    gc)
+    train_rows = add_hotspot_distances(add_geo_label_to_df(train_rows, gc))
+    val_rows   = add_hotspot_distances(add_geo_label_to_df(val_rows,   gc))
+    test_df    = add_hotspot_distances(add_geo_label_to_df(test_df,    gc))
 
     feature_cols = NUMERIC_FEATURES + ONEHOT_FEATURES + ORDINAL_FEATURES
     X_train = train_rows[feature_cols]
@@ -74,8 +80,9 @@ def main():
 
     print(f"Train: {len(X_train)} rows  |  Val: {len(X_val)} rows")
     print("Fitting model …")
-    model = build_pipeline()
-    model.fit(X_train, y_train)
+    model  = build_pipeline()
+    sw     = compute_sample_weight("balanced", y_train)
+    model.fit(X_train, y_train, classifier__sample_weight=sw)
 
     val_preds = model.predict(X_val)
     f1 = f1_score(y_val, val_preds, average="macro")
