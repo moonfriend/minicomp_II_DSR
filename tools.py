@@ -250,7 +250,7 @@ MODEL_PATH = Path("models/xgb_model.joblib")
 GEO_PATH   = Path("models/geo_clusterer.joblib")
 HF_REPO    = "Li-1113/airbnb-price-tier"
 HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_REPO}"
-XGB_WEIGHT = 0.4   # re-estimate after class-balance improvements; re-sweep in Colab
+XGB_WEIGHT = 0.5   # 50/50 ensemble: XGBoost and HF transformer equally weighted
 
 from geo_features import HOTSPOT_FEATURES
 
