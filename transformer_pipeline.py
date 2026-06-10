@@ -146,6 +146,10 @@ def row_to_text(row: dict) -> str:
     elif nbg:
         parts.append(f"located in {nbg}")
 
+    geo = str(row.get("geo_label", "") or "").strip()
+    if geo:
+        parts.append(geo)
+
     room_type = str(row.get("room_type", "") or "").strip()
     if room_type:
         parts.append(room_type.lower())
@@ -162,8 +166,6 @@ def row_to_text(row: dict) -> str:
     t = _availability_text(row.get("availability_365"), row.get("number_of_reviews"))
     if t:
         parts.append(t)
-
-    # TODO: convert latitude/longitude to area description (backlog)
 
     return ". ".join(parts) + "."
 
@@ -333,6 +335,9 @@ def train_frozen(cfg, train_texts, val_texts, test_texts,
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main(strategy: str):
+    from pathlib import Path
+    from geo_features import GeoClusterer, add_geo_label_to_df
+
     cfg = STRATEGIES[strategy]
     print(f"\n{'='*50}\nStrategy: {strategy.upper()}\n{'='*50}")
 
@@ -341,6 +346,21 @@ def main(strategy: str):
 
     y_train_list = y_train.tolist()
     y_val_list   = y_val.tolist()
+
+    # fit geo clusterer on training rows (need original df for price_tier)
+    geo_model_path = Path("models/geo_clusterer.joblib")
+    if geo_model_path.exists():
+        gc = GeoClusterer.load(geo_model_path)
+        print("Loaded existing GeoClusterer.")
+    else:
+        train_rows_with_tier = train_df.loc[X_train.index]
+        gc = GeoClusterer()
+        gc.fit(train_rows_with_tier)
+        gc.save(geo_model_path)
+
+    X_train = add_geo_label_to_df(X_train, gc)
+    X_val   = add_geo_label_to_df(X_val,   gc)
+    test_df = add_geo_label_to_df(test_df, gc)
 
     print("Building combined text+tabular strings …")
     train_texts = build_texts(X_train.reset_index(drop=True))
