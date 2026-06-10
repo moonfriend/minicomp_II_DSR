@@ -1,0 +1,17 @@
+fastapi>=0.111.0
+uvicorn>=0.29.0
+python-multipart>=0.0.9
+pandas>=2.2.0
+scikit-learn>=1.4.0
+xgboost>=2.0.0
+joblib>=1.4.0
+langchain>=0.2.0
+langchain-core>=0.2.0
+langchain-ollama>=0.1.0
+langchain-openai>=0.1.0
+langgraph>=0.1.0
+sentence-transformers>=3.0.0
+transformers>=4.40.0
+torch>=2.2.0
+accelerate>=0.29.0
+sentencepiece>=0.2.0

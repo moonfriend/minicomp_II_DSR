@@ -15,6 +15,10 @@ env/
 # LibreOffice lock files
 .~lock.*
 
+# HuggingFace checkpoints and serialised models (large, rebuild locally)
+outputs/hf_*/
+models/*.joblib
+
 # Jupyter
 .ipynb_checkpoints/
 
