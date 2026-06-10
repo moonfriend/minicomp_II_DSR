@@ -227,21 +227,28 @@ Example: {{"2": {{"neighbourhood_group": "Manhattan", "room_type": "Entire home/
 # ── XGBoost prediction ────────────────────────────────────────────────────────
 
 MODEL_PATH = Path("models/xgb_model.joblib")
+GEO_PATH   = Path("models/geo_clusterer.joblib")
 
 NUMERIC  = ["minimum_nights", "number_of_reviews", "calculated_host_listings_count",
             "availability_365", "latitude", "longitude"]
 ONEHOT   = ["neighbourhood_group", "room_type"]
-ORDINAL  = ["neighbourhood"]
+ORDINAL  = ["neighbourhood", "geo_label"]
 
 
 @tool
 def run_xgb_predict(records_json: str) -> str:
     """
     Load the pre-trained XGBoost pipeline and predict price_tier.
+    Applies geographic cluster label before predicting.
     Returns JSON list of {property_id, price_tier}.
     """
+    from geo_features import GeoClusterer, add_geo_label_to_df
+
     records = json.loads(records_json)
     df = pd.DataFrame(records)
+
+    gc = GeoClusterer.load(GEO_PATH)
+    df = add_geo_label_to_df(df, gc)
 
     pipeline = joblib.load(MODEL_PATH)
     feature_cols = NUMERIC + ONEHOT + ORDINAL

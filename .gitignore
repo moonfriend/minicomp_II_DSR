@@ -15,9 +15,10 @@ env/
 # LibreOffice lock files
 .~lock.*
 
-# HuggingFace checkpoints and serialised models (large, rebuild locally)
+# HuggingFace checkpoints (large, rebuild locally)
 outputs/hf_*/
-models/*.joblib
+
+# models/*.joblib are intentionally tracked — Railway needs them at runtime
 
 # Jupyter
 .ipynb_checkpoints/
