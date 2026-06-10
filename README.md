@@ -2,45 +2,15 @@
 
 Predict the `price_tier` (0–3) of NYC Airbnb listings using tabular features and listing descriptions.
 
-## Project Structure
+**Metric:** Macro F1-Score across 4 tiers: Budget (0) · Standard (1) · Premium (2) · Ultra-Luxury (3)
 
-```
-.
-├── data/
-│   ├── train.csv            # original training data
-│   ├── test.csv             # original test data
-│   ├── train_01.csv         # processed training data (used by scripts)
-│   ├── test_01.csv          # processed test data (used by scripts)
-│   └── archive/             # earlier data versions
-├── docs/
-│   ├── PRD.odt              # product requirements
-│   └── Prompt to Production - Student Brief.pdf
-├── outputs/                 # generated prediction CSVs
-├── utils.py                 # shared data loading, splitting, scoring
-├── xgb_pipeline.py          # tabular-only XGBoost
-├── xgb_embeddings.py        # sentence-transformer embeddings → XGBoost
-├── xgb_embeddings_tabular.py# embeddings + tabular → XGBoost (hybrid)
-├── xgb_llm_features.py      # LLM-extracted boolean flags + tabular → XGBoost
-├── pipeline.py              # few-shot LLM pipeline (llama3.2 via Ollama)
-└── compare.py               # run all pipelines and print F1 comparison table
-```
-
-## Price Tiers
-
-| Tier | Label        |
-|------|-------------|
-| 0    | Budget       |
-| 1    | Standard     |
-| 2    | Premium      |
-| 3    | Ultra-Luxury |
-
-Metric: **Macro F1-Score**
+---
 
 ## Setup
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install xgboost scikit-learn pandas sentence-transformers langchain-ollama
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
 For LLM-based pipelines, [Ollama](https://ollama.com) must be running locally with `llama3.2` pulled:
@@ -49,23 +19,80 @@ For LLM-based pipelines, [Ollama](https://ollama.com) must be running locally wi
 ollama pull llama3.2
 ```
 
-## Usage
+---
 
-Run a single pipeline:
+## Project Structure
 
-```bash
-python xgb_pipeline.py              # tabular-only (fastest)
-python xgb_embeddings.py            # embeddings-only
-python xgb_embeddings_tabular.py    # hybrid (best ML score)
-python xgb_llm_features.py          # LLM flag extraction + tabular
-python pipeline.py                  # few-shot LLM classifier
+```
+data/
+  train_01.csv / test_01.csv   ← dataset used by all scripts
+  train.csv / test.csv         ← original files (not used directly)
+
+utils.py                       ← shared: load_data(), split(), score(), save_predictions()
+
+── XGBoost pipelines ──────────────────────────────────────────────
+xgb_pipeline.py                ← tabular features only              (F1 ≈ 0.54)
+xgb_embeddings.py              ← sentence-transformer embeddings     (F1 ≈ 0.43)
+xgb_embeddings_tabular.py      ← embeddings + tabular (hybrid)       (F1 ≈ 0.51)
+xgb_llm_features.py            ← LLM boolean flags + tabular         (not yet benchmarked)
+compare.py                     ← run all XGBoost pipelines, print F1 table
+
+── Transformer pipelines ───────────────────────────────────────────
+transformer_pipeline.py        ← unified entry point for all transformer strategies
+                                  converts every tabular column to natural language,
+                                  concatenates with description, fine-tunes transformer
+
+── LLM few-shot pipeline ───────────────────────────────────────────
+pipeline.py                    ← few-shot llama3.2 classifier via Ollama (F1 ≈ 0.19, baseline)
+
+── Deployment ──────────────────────────────────────────────────────
+app.py                         ← FastAPI: POST /predict accepts CSV, returns predictions CSV
+agent.py                       ← LangGraph agent orchestrating the tools
+tools.py                       ← LangChain tools: column normaliser, LLM flag extractor, XGB predictor
+Dockerfile                     ← for Railway deployment
+.devcontainer/                 ← devcontainer config (Python 3.12 + Ollama)
+
+outputs/                       ← generated prediction CSVs written here
 ```
 
-Compare all non-LLM pipelines:
+---
+
+## Running experiments
+
+### XGBoost baselines
 
 ```bash
-python compare.py          # tabular, embeddings, hybrid
-python compare.py --llm    # include LLM-based pipeline
+python xgb_pipeline.py                    # tabular only — fastest, best XGB baseline
+python compare.py                         # compare all fast pipelines
+python compare.py --llm                   # include LLM flag extraction (slow ~30 min)
 ```
 
-All prediction files are saved to `outputs/`.
+### Transformer pipeline
+
+Three strategies, all using text + tabular features fused into natural language:
+
+```bash
+python transformer_pipeline.py --strategy tiny    # bert-tiny 4.4M params  ~10 min CPU
+python transformer_pipeline.py --strategy frozen  # distilbert frozen backbone ~8 min CPU
+python transformer_pipeline.py --strategy full    # distilbert full fine-tune  ~60 min CPU
+```
+
+All predictions are saved to `outputs/`.
+
+### FastAPI (local test before Railway)
+
+```bash
+python app.py
+# then in another terminal:
+curl -X POST http://localhost:8000/predict -F "file=@data/test_01.csv" -o predictions.csv
+```
+
+---
+
+## Backlog / next steps
+
+- [ ] Train and serialize best model to `models/xgb_model.joblib` (needed for Railway)
+- [ ] Add `railway.json` and deploy with `railway up`
+- [ ] Set `OPENROUTER_API_KEY` in Railway environment variables
+- [ ] Convert lat/lon to natural language area description in `row_to_text()`
+- [ ] Benchmark `xgb_llm_features.py`
