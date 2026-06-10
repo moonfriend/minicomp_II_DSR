@@ -19,17 +19,37 @@ from langchain_core.prompts import PromptTemplate
 
 # ── LLM factory ───────────────────────────────────────────────────────────────
 
+OPENROUTER_MODEL = "meta-llama/llama-3.1-8b-instruct"
+OLLAMA_MODEL     = "llama3.2"
+
+
 def _get_llm():
     if os.getenv("OPENROUTER_API_KEY"):
         from langchain_openai import ChatOpenAI
         return ChatOpenAI(
-            model="meta-llama/llama-3.1-8b-instruct:free",
+            model=OPENROUTER_MODEL,
             base_url="https://openrouter.ai/api/v1",
             api_key=os.environ["OPENROUTER_API_KEY"],
             temperature=0,
+            request_timeout=30,
         )
     from langchain_ollama import OllamaLLM
-    return OllamaLLM(model="llama3.2", temperature=0)
+    return OllamaLLM(model=OLLAMA_MODEL, temperature=0)
+
+
+def check_llm() -> dict:
+    """
+    Quick LLM connectivity check. Call this at startup to surface problems early.
+    Returns {"ok": True, "backend": "openrouter|ollama"} or {"ok": False, "error": "..."}.
+    """
+    try:
+        llm = _get_llm()
+        backend = "openrouter" if os.getenv("OPENROUTER_API_KEY") else "ollama"
+        raw = llm.invoke("Reply with the single word: ok")
+        text = raw.content if hasattr(raw, "content") else str(raw)
+        return {"ok": True, "backend": backend, "response": text.strip()[:20]}
+    except Exception as e:
+        return {"ok": False, "backend": "unknown", "error": str(e)}
 
 
 def _llm_json(prompt_text: str) -> dict:

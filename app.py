@@ -14,6 +14,7 @@ from typing import List, Optional, Tuple
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from agent import run
+from tools import check_llm
 
 app = FastAPI(
     title="Airbnb Price Tier Predictor",
@@ -99,7 +100,11 @@ def _compute_f1(predictions_json: str, labels_df: pd.DataFrame) -> dict:
     return {
         "macro_f1": round(macro_f1, 4),
         "n_evaluated": len(merged),
-        "report": classification_report(y_true, y_pred, target_names=TIER_NAMES),
+        "report": classification_report(
+            y_true, y_pred,
+            labels=[0, 1, 2, 3], target_names=TIER_NAMES,
+            zero_division=0,
+        ),
     }
 
 
@@ -125,6 +130,14 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/llm-health")
+def llm_health():
+    """Check LLM connectivity (OpenRouter or Ollama). Use this to verify the key works."""
+    result = check_llm()
+    status_code = 200 if result["ok"] else 503
+    return JSONResponse(content=result, status_code=status_code)
 
 
 @app.post("/predict")

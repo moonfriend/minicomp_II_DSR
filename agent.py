@@ -103,7 +103,11 @@ def node_evaluate(state: AgentState) -> AgentState:
         result = {
             "macro_f1":    round(macro_f1, 4),
             "n_evaluated": len(merged),
-            "report":      classification_report(y_true, y_pred, target_names=TIER_NAMES),
+            "report":      classification_report(
+                y_true, y_pred,
+                labels=[0, 1, 2, 3], target_names=TIER_NAMES,
+                zero_division=0,
+            ),
         }
         print(f"\n[agent] Macro F1: {macro_f1:.4f}  (n={len(merged)})")
         return {**state, "evaluation": json.dumps(result)}
