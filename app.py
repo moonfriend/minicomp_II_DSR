@@ -29,11 +29,9 @@ _startup_error = ""
 def _preload_models():
     global _models_ready, _startup_error
     try:
-        from tools import _load_xgb, _load_transformer
+        from tools import _load_xgb
         _load_xgb()
         print("[startup] XGBoost + GeoClusterer loaded.")
-        _load_transformer()
-        print("[startup] Transformer loaded.")
         _models_ready = True
         print("[startup] All models ready.")
     except Exception as e:

@@ -250,6 +250,7 @@ Example: {{"2": {{"neighbourhood_group": "Manhattan", "room_type": "Entire home/
 MODEL_PATH = Path("models/xgb_model.joblib")
 GEO_PATH   = Path("models/geo_clusterer.joblib")
 HF_REPO    = "Li-1113/airbnb-price-tier"
+HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_REPO}"
 XGB_WEIGHT = 0.3   # tuned on validation_full.csv: best F1=0.5895 at xgb_w=0.3
 
 NUMERIC  = ["minimum_nights", "number_of_reviews", "calculated_host_listings_count",
@@ -258,10 +259,8 @@ ONEHOT   = ["neighbourhood_group", "room_type"]
 ORDINAL  = ["neighbourhood", "geo_label"]
 
 # module-level cache — loaded once, reused across requests
-_xgb_pipeline    = None
-_geo_clusterer   = None
-_transformer     = None
-_tokenizer       = None
+_xgb_pipeline  = None
+_geo_clusterer = None
 
 
 def _load_xgb():
@@ -274,34 +273,102 @@ def _load_xgb():
     return _xgb_pipeline, _geo_clusterer
 
 
-def _load_transformer():
-    global _transformer, _tokenizer
-    if _transformer is None:
-        from transformers import AutoModelForSequenceClassification, AutoTokenizer
-        hf_token = os.getenv("HF_TOKEN")
-        print(f"  Loading transformer from {HF_REPO} …")
-        _tokenizer   = AutoTokenizer.from_pretrained(HF_REPO, token=hf_token)
-        _transformer = AutoModelForSequenceClassification.from_pretrained(
-            HF_REPO, num_labels=4, token=hf_token
-        )
-        _transformer.eval()
-        print("  Transformer loaded.")
-    return _transformer, _tokenizer
+# ── Text builder (inlined from transformer_pipeline to avoid torch import) ────
+
+def _row_to_text(row: dict) -> str:
+    parts = []
+    desc = str(row.get("description", "") or "").strip()
+    if desc:
+        parts.append(desc)
+    nb, nbg = str(row.get("neighbourhood", "") or "").strip(), str(row.get("neighbourhood_group", "") or "").strip()
+    if nb and nbg:  parts.append(f"located in {nb}, {nbg}")
+    elif nbg:       parts.append(f"located in {nbg}")
+    geo = str(row.get("geo_label", "") or "").strip()
+    if geo:         parts.append(geo)
+    rt = str(row.get("room_type", "") or "").strip()
+    if rt:          parts.append(rt.lower())
+
+    mn = row.get("minimum_nights")
+    try:
+        n = int(float(mn))
+        if   n <= 1:  parts.append("flexible stay (1 night minimum)")
+        elif n <= 3:  parts.append(f"short stay ({n} night minimum)")
+        elif n <= 7:  parts.append(f"weekly stay ({n} night minimum)")
+        elif n <= 30: parts.append(f"extended stay ({n} night minimum)")
+        else:         parts.append(f"long-term stay ({n} night minimum)")
+    except (TypeError, ValueError):
+        pass
+
+    nr = row.get("number_of_reviews")
+    try:
+        n = int(float(nr))
+        if   n == 0:  parts.append("new listing, no reviews yet")
+        elif n <= 5:  parts.append(f"very few reviews ({n})")
+        elif n <= 20: parts.append(f"few reviews ({n})")
+        elif n <= 50: parts.append(f"several reviews ({n})")
+        elif n <= 100:parts.append(f"many reviews ({n})")
+        else:         parts.append(f"highly reviewed ({n} reviews)")
+    except (TypeError, ValueError):
+        pass
+
+    av = row.get("availability_365")
+    try:
+        n = int(float(av))
+        if n <= 30:   parts.append("rarely available, almost always booked")
+        elif n <= 90: parts.append(f"occasionally available ({n} days/year)")
+        elif n <= 180:parts.append(f"often available ({n} days/year)")
+        else:         parts.append(f"frequently available ({n} days/year)")
+    except (TypeError, ValueError):
+        pass
+
+    return ". ".join(parts) + "."
+
+
+# ── HuggingFace Inference API (no torch, no local model weights) ──────────────
+
+def _hf_api_proba(texts: list, batch_size: int = 32) -> np.ndarray:
+    """Call HF Inference API; returns (N,4) probability array."""
+    import requests, time
+    token = os.getenv("HF_TOKEN")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+
+    all_probas: list = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        for attempt in range(4):
+            resp = requests.post(HF_API_URL, headers=headers,
+                                 json={"inputs": batch}, timeout=60)
+            if resp.status_code == 503:
+                wait = min(resp.json().get("estimated_time", 20), 40)
+                print(f"  HF model loading, waiting {wait:.0f}s …")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            break
+        result = resp.json()
+        if isinstance(result[0], dict):   # single-item response
+            result = [result]
+        for item_scores in result:
+            proba = [0.0, 0.0, 0.0, 0.0]
+            for s in item_scores:
+                idx = int(s["label"].split("_")[-1])
+                proba[idx] = s["score"]
+            all_probas.append(proba)
+
+    return np.array(all_probas)
 
 
 @tool
 def run_ensemble_predict(records_json: str) -> str:
     """
-    Ensemble: XGBoost tabular + DistilBERT text probabilities → weighted average.
-    Falls back to XGBoost-only if the transformer cannot be loaded.
+    Ensemble: XGBoost tabular + HF Inference API text probabilities → weighted average.
+    Falls back to XGBoost-only if the HF API is unreachable.
     Returns JSON list of {property_id, price_tier}.
     """
-    import torch
     from geo_features import add_geo_label_to_df
-    from transformer_pipeline import build_texts, MAX_LEN
 
-    records  = json.loads(records_json)
-    df       = pd.DataFrame(records)
+    records = json.loads(records_json)
+    df      = pd.DataFrame(records)
 
     pipeline, gc = _load_xgb()
     df_geo = add_geo_label_to_df(df, gc)
@@ -309,24 +376,14 @@ def run_ensemble_predict(records_json: str) -> str:
     # ── XGBoost probabilities ──────────────────────────────────────────────────
     xgb_proba = pipeline.predict_proba(df_geo[NUMERIC + ONEHOT + ORDINAL])  # (N,4)
 
-    # ── Transformer probabilities (with fallback) ──────────────────────────────
+    # ── HF API probabilities (with fallback) ───────────────────────────────────
     try:
-        model, tokenizer = _load_transformer()
-        texts      = build_texts(df_geo.reset_index(drop=True))
-        all_logits = []
-        for i in range(0, len(texts), 64):
-            enc = tokenizer(
-                texts[i:i + 64], truncation=True,
-                padding="max_length", max_length=MAX_LEN, return_tensors="pt",
-            )
-            with torch.no_grad():
-                all_logits.append(model(**enc).logits)
-        logits            = torch.cat(all_logits, dim=0)
-        transformer_proba = torch.softmax(logits, dim=1).numpy()
-        combined          = XGB_WEIGHT * xgb_proba + (1 - XGB_WEIGHT) * transformer_proba
-        print(f"  Ensemble: XGBoost×{XGB_WEIGHT} + Transformer×{1-XGB_WEIGHT}")
+        texts    = [_row_to_text(r) for r in df_geo.reset_index(drop=True).to_dict(orient="records")]
+        hf_proba = _hf_api_proba(texts)
+        combined = XGB_WEIGHT * xgb_proba + (1 - XGB_WEIGHT) * hf_proba
+        print(f"  Ensemble: XGBoost×{XGB_WEIGHT} + HF-API×{1 - XGB_WEIGHT}")
     except Exception as e:
-        print(f"  Transformer unavailable ({e}), using XGBoost only.")
+        print(f"  HF API unavailable ({e}), using XGBoost only.")
         combined = xgb_proba
 
     preds = np.argmax(combined, axis=1)
